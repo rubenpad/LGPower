@@ -35,12 +35,27 @@ object TvDiscovery {
     /** Blocking — call from a background thread. Returns deduplicated IPs. */
     fun discover(context: Context): List<String> = discoverDetailed(context).map { it.ip }
 
-    /** Same, with the SSDP fingerprint for TVs that answered the multicast search. */
+    /**
+     * Same, with each TV's Fingerprint. TVs the multicast search missed (routers that filter
+     * multicast find them only by the port scan) are asked directly, all at once.
+     */
     fun discoverDetailed(context: Context): List<Found> {
         locations.clear()
         val ips = discoverIps(context)
-        return ips.map { ip -> Found(ip, locations[ip]?.let { udnFrom(it) }) }
+        val fromSearch = ips.associateWith { ip -> locations[ip]?.let { udnFrom(it) } }
+        val missing = fromSearch.filterValues { it == null }.keys
+        val asked = java.util.concurrent.ConcurrentHashMap<String, String>()
+        missing.map { ip -> Thread { fingerprint(context, ip)?.let { asked[ip] = it } }.apply { start() } }
+            .forEach { it.join(2_500) }
+        return ips.map { ip -> Found(ip, fromSearch[ip] ?: asked[ip]) }
     }
+
+    /**
+     * A TV's Fingerprint by whichever way it answers: asked directly first, then by a full
+     * multicast search, since some sets ignore one of the two. Blocking, up to a few seconds.
+     */
+    fun fingerprintAnyWay(context: Context, ip: String): String? =
+        fingerprint(context, ip) ?: discoverDetailed(context).firstOrNull { it.ip == ip }?.udn
 
     // LOCATION header per responding IP, kept so the description can be fetched afterwards
     private val locations = java.util.concurrent.ConcurrentHashMap<String, String>()
@@ -52,14 +67,70 @@ object TvDiscovery {
     fun fingerprint(context: Context, ip: String): String? = try {
         val socket = DatagramSocket().apply { soTimeout = 1000 }
         if (!LanNetwork.isTethered(context, ip)) LanNetwork.get(context)?.bindSocket(socket)
-        val data = ssdpSearch("urn:lge-com:service:webos-second-screen:1").toByteArray()
-        socket.send(DatagramPacket(data, data.size, InetAddress.getByName(ip), SSDP_PORT))
+        // UPnP 1.1 shapes a unicast search with the TV itself as HOST and no MX, older stacks
+        // expect the multicast shape; whichever the TV takes, the first answer wins
+        val unicast = ("M-SEARCH * HTTP/1.1\r\nHOST: $ip:$SSDP_PORT\r\nMAN: \"ssdp:discover\"\r\n" +
+            "ST: urn:lge-com:service:webos-second-screen:1\r\n\r\n").toByteArray()
+        val multicastShape = ssdpSearch("urn:lge-com:service:webos-second-screen:1").toByteArray()
+        for (data in listOf(unicast, multicastShape))
+            socket.send(DatagramPacket(data, data.size, InetAddress.getByName(ip), SSDP_PORT))
         val buf = ByteArray(2048)
         val pkt = DatagramPacket(buf, buf.size)
         socket.receive(pkt)
         socket.close()
         locationOf(String(pkt.data, 0, pkt.length))?.let { udnFrom(it) }
     } catch (_: Exception) { null }
+
+    /**
+     * Listens for TVs' SSDP "alive" Announcements, which a webOS TV multicasts when it joins the
+     * network (after a power cut, a Wi-Fi drop, a new DHCP lease). Covers the LAN and the phone's
+     * own hotspot. [onFound] runs on the listener thread. Returns a stop function.
+     */
+    fun listenForAnnouncements(context: Context, onFound: (Found) -> Unit): () -> Unit {
+        val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        val lock = wm.createMulticastLock("lg_power_announce").apply { setReferenceCounted(false) }
+        val socket = try {
+            MulticastSocket(null).apply {
+                reuseAddress = true
+                soTimeout = 1000
+                bind(InetSocketAddress(SSDP_PORT))
+            }
+        } catch (_: Exception) {
+            return {}
+        }
+        val group = InetSocketAddress(InetAddress.getByName(SSDP_ADDR), SSDP_PORT)
+        val interfaces = buildList {
+            LanNetwork.get(context)?.let { n ->
+                val cm = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                cm.getLinkProperties(n)?.interfaceName?.let { NetworkInterface.getByName(it) }?.let(::add)
+            }
+            LanNetwork.tetheredAddresses(context).mapNotNull { NetworkInterface.getByInetAddress(it) }.forEach(::add)
+        }.distinct()
+        var joined = 0
+        for (nif in interfaces) if (runCatching { socket.joinGroup(group, nif) }.isSuccess) joined++
+        if (joined == 0) { socket.close(); return {} }
+        lock.acquire()
+        val running = java.util.concurrent.atomic.AtomicBoolean(true)
+        Thread {
+            val buf = ByteArray(2048)
+            while (running.get()) {
+                try {
+                    val pkt = DatagramPacket(buf, buf.size)
+                    socket.receive(pkt)
+                    val sender = pkt.address?.hostAddress ?: continue
+                    announcementOf(String(pkt.data, 0, pkt.length), sender)?.let(onFound)
+                } catch (_: SocketTimeoutException) {
+                } catch (_: Exception) {
+                    if (running.get()) Thread.sleep(500)
+                }
+            }
+        }.apply { isDaemon = true; name = "tv-announcements" }.start()
+        return {
+            running.set(false)
+            runCatching { socket.close() }
+            runCatching { lock.release() }
+        }
+    }
 
     private fun locationOf(response: String): String? =
         response.lines().firstOrNull { it.startsWith("LOCATION", ignoreCase = true) }

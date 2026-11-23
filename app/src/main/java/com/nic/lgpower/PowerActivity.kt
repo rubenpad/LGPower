@@ -57,7 +57,9 @@ class PowerActivity : Activity() {
     // Same cadence as MainActivity.wakeTv: ~3 s from Quick Start standby, 15-20 s from cold
     private fun wake(client: WebOsClient) {
         client.sendWakeOnLan()
-        repeat(25) {
+        repeat(25) { i ->
+            // A TV that lost power may boot onto a new address; look for it while it comes up
+            if (i in RELOCATE_AT_S) Thread { Relocator.scan(this, force = true) }.start()
             if (client.afterWake() is WebOsClient.Result.Success) {
                 client.turnOnScreen()
                 return
@@ -66,6 +68,8 @@ class PowerActivity : Activity() {
         }
         toast("TV didn't answer. On the TV, check Turn on via Wi-Fi and Quick Start+ (Always Ready)")
     }
+
+    private val RELOCATE_AT_S = setOf(4, 9, 14)
 
     private fun toast(msg: String) = runOnUiThread { Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
 }
