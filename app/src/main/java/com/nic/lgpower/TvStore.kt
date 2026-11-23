@@ -85,10 +85,18 @@ object TvStore {
         prefs.edit().putString("tv_ip", tv.ip).putString("tv_mac", tv.mac).putString("client_key", tv.clientKey).apply()
     }
 
-    /** Edits from the TV detail screen; the live prefs follow when it is the active TV. */
+    /**
+     * Edits from the TV detail screen; the live prefs follow when it is the active TV. A typed
+     * address wins over the stored Fingerprint: it is cleared so the next connection there
+     * fills in whichever TV actually answers.
+     */
     fun update(prefs: SharedPreferences, id: String, name: String, ip: String, mac: String) {
         write(prefs, read(prefs).map {
-            if (it.id == id) it.copy(name = name.trim().ifBlank { it.name }, ip = ip.ifBlank { it.ip }, mac = mac) else it
+            if (it.id != id) it
+            else {
+                val newIp = ip.ifBlank { it.ip }
+                it.copy(name = name.trim().ifBlank { it.name }, ip = newIp, mac = mac, udn = if (newIp == it.ip) it.udn else "")
+            }
         })
         if (prefs.getString(ACTIVE, null) == id) {
             val e = prefs.edit().putString("tv_mac", mac)
@@ -100,6 +108,26 @@ object TvStore {
     /** Which saved TV a discovered one is, if any: by fingerprint when both sides have one, else by address. */
     fun match(prefs: SharedPreferences, ip: String, udn: String?): Tv? = list(prefs).firstOrNull { tv ->
         if (!udn.isNullOrBlank() && tv.udn.isNotBlank()) tv.udn == udn else tv.ip == ip
+    }
+
+    /**
+     * Relocation: moves Saved TVs (id → new address); the live prefs follow for the active one.
+     * True when the active TV moved.
+     */
+    fun relocate(prefs: SharedPreferences, moves: Map<String, String>): Boolean {
+        if (moves.isEmpty()) return false
+        syncFromLive(prefs)
+        write(prefs, read(prefs).map { tv -> moves[tv.id]?.let { tv.copy(ip = it) } ?: tv })
+        val active = prefs.getString(ACTIVE, null)
+        val newIp = moves[active] ?: return false
+        prefs.edit().putString("tv_ip", newIp).apply()
+        return true
+    }
+
+    /** Fills in a Fingerprint for a Saved TV that has none, as long as it is still at [ip]. */
+    fun backfillFingerprint(prefs: SharedPreferences, id: String, ip: String, udn: String) {
+        if (udn.isBlank()) return
+        write(prefs, read(prefs).map { if (it.id == id && it.ip == ip && it.udn.isBlank()) it.copy(udn = udn) else it })
     }
 
     fun rename(prefs: SharedPreferences, id: String, name: String) {

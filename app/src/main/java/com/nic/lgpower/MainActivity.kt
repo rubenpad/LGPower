@@ -65,6 +65,14 @@ class MainActivity : AppCompatActivity() {
     // A recreated activity never dismisses the old keyboard sheet, so its watcher is stopped here too
     private var stopKeyboardFocus: (() -> Unit)? = null
     private val levelsInterval = 5_000L
+    // Relocation: the announcement listener, the phone's LAN watcher, and the last LAN seen
+    private var stopAnnouncements: (() -> Unit)? = null
+    private var lanCallback: android.net.ConnectivityManager.NetworkCallback? = null
+    private var lastLan: android.net.Network? = null
+    @Volatile private var resumed = false
+    private var listenGen = 0
+    // Address a Fingerprint backfill was already tried at this run, so it runs once per address
+    private var backfillTriedAt: String? = null
 
     private enum class TvStatus { CHECKING, CONNECTED, SEARCHING, PAIRING, DISCONNECTED }
     @Volatile private var tvConnected = false
@@ -572,6 +580,11 @@ class MainActivity : AppCompatActivity() {
         if (cachedVolume >= 0) setVolumeState(cachedVolume, cachedMuted)
         val cachedBrightness = appPrefs.getInt("last_brightness", -1)
         if (cachedBrightness >= 0) setBrightnessBar(cachedBrightness)
+        resumed = true
+        Relocator.gate.reset()
+        // A lookup the TV didn't answer gets another go each time the remote comes back
+        backfillTriedAt = null
+        startRelocationWatch()
         startWatching()
     }
 
@@ -587,6 +600,8 @@ class MainActivity : AppCompatActivity() {
         LowLatencyWifi.release()
         demoReceiver?.let { runCatching { unregisterReceiver(it) }; demoReceiver = null }
         super.onPause()
+        resumed = false
+        stopRelocationWatch()
         stopWatching?.invoke()
         stopWatching = null
         statusHandler.removeCallbacks(levelsRefresh)
@@ -832,11 +847,15 @@ class MainActivity : AppCompatActivity() {
         val wasOn = tvConnected
         when (p) {
             WebOsClient.Presence.Unknown      -> setStatus(TvStatus.CHECKING)
-            WebOsClient.Presence.Unreachable  -> setStatus(TvStatus.DISCONNECTED)
+            WebOsClient.Presence.Unreachable  -> {
+                setStatus(TvStatus.DISCONNECTED)
+                relocateInBackground(force = false)
+            }
             WebOsClient.Presence.NeedsPairing -> setStatus(TvStatus.PAIRING)
             is WebOsClient.Presence.Reported -> {
                 setStatus(if (p.isOn) TvStatus.CONNECTED else TvStatus.DISCONNECTED)
                 if (p.isOn) client.warmPointerSession()
+                backfillFingerprint()
                 setScreenOffButton(p.isOn && p.screenOff)
             }
         }
@@ -878,6 +897,8 @@ class MainActivity : AppCompatActivity() {
         repeat(maxOf(WAKE_RETRIES, hintAfter + 1)) { i ->
             if (wakeHomeGen != gen) return
             if (i == hintAfter) runOnUiThread { showWakeHint() }
+            // A TV that lost power may boot onto a new address; look for it while it comes up
+            if (i in WAKE_RELOCATE_AT_S) relocateInBackground(force = true)
             // Attempts that overlap all wait on the same connecting command session and are
             // released together when it registers, so each would send the action
             if (inFlight.compareAndSet(false, true)) Thread {
@@ -896,6 +917,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private val WAKE_RETRIES = 25
+    private val WAKE_RELOCATE_AT_S = setOf(4, 9, 14)
     private val WAKE_HINT_FIRST_S = 10
     private val WAKE_HINT_STEP_S = 5
     private val WAKE_HINT_MAX_S = 60
@@ -1346,16 +1368,79 @@ class MainActivity : AppCompatActivity() {
         if (discovering) return
         discovering = true
         Thread {
-            val found = TvDiscovery.discover(this)
+            val found = TvDiscovery.discoverDetailed(this)
+            val pick = firstRunPick(TvStore.active(appPrefs)?.udn, found)
             runOnUiThread {
                 discovering = false
-                if (found.isNotEmpty()) {
-                    client.saveTvIp(found[0])
+                if (pick != null) {
+                    client.saveTvIp(pick)
                     startWatching()
                 } else {
                     setStatus(TvStatus.DISCONNECTED)
                 }
             }
+        }.start()
+    }
+
+    // ── Relocation ───────────────────────────────────────────────────────────
+
+    /** Scans for Saved TVs at new addresses; reconnects when the active one moved. */
+    private fun relocateInBackground(force: Boolean) {
+        Thread {
+            if (Relocator.scan(this, force)) runOnUiThread { if (resumed) startWatching() }
+        }.start()
+    }
+
+    private fun startRelocationWatch() {
+        stopAnnouncements?.invoke()
+        stopAnnouncements = null
+        val gen = ++listenGen
+        Thread {
+            val stop = TvDiscovery.listenForAnnouncements(this) { found ->
+                if (Relocator.apply(this, listOf(found))) runOnUiThread { if (resumed) startWatching() }
+            }
+            // Only the newest listener stays; one opened before a pause or a network change is closed
+            runOnUiThread { if (resumed && gen == listenGen) stopAnnouncements = stop else stop() }
+        }.start()
+        if (lanCallback != null) return
+        val cm = getSystemService(android.net.ConnectivityManager::class.java) ?: return
+        val request = android.net.NetworkRequest.Builder()
+            .addTransportType(android.net.NetworkCapabilities.TRANSPORT_WIFI)
+            .addTransportType(android.net.NetworkCapabilities.TRANSPORT_ETHERNET)
+            .build()
+        val callback = object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: android.net.Network) {
+                runOnUiThread {
+                    val changed = lastLan != null && lastLan != network
+                    lastLan = network
+                    if (!changed || !resumed) return@runOnUiThread
+                    // The phone joined another network: listen there, and look for the TV now
+                    startRelocationWatch()
+                    if (!tvConnected) relocateInBackground(force = true)
+                }
+            }
+        }
+        runCatching { cm.registerNetworkCallback(request, callback) }.onSuccess { lanCallback = callback }
+    }
+
+    private fun stopRelocationWatch() {
+        listenGen++
+        stopAnnouncements?.invoke()
+        stopAnnouncements = null
+        lanCallback?.let { cb ->
+            runCatching { getSystemService(android.net.ConnectivityManager::class.java)?.unregisterNetworkCallback(cb) }
+        }
+        lanCallback = null
+    }
+
+    /** Older Saved TVs have no Fingerprint, so Relocation can't find them; ask the TV once it answers. */
+    private fun backfillFingerprint() {
+        val tv = TvStore.active(appPrefs) ?: return
+        val ip = client.tvIp
+        if (tv.udn.isNotBlank() || ip.isBlank() || ip != tv.ip || backfillTriedAt == ip) return
+        backfillTriedAt = ip
+        Thread {
+            Relocator.lookUpFingerprint(this, ip)?.let { TvStore.backfillFingerprint(appPrefs, tv.id, ip, it) }
         }.start()
     }
 

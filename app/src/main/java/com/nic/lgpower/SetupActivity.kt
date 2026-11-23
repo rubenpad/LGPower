@@ -240,7 +240,7 @@ class SetupActivity : AppCompatActivity() {
                     Thread {
                         val mac = client.getMacFromDevice()
                         if (mac != null) runOnUiThread { if (!addCancelled) client.saveTvMac(mac) }
-                        if (pairedUdn == null) pairedUdn = TvDiscovery.fingerprint(this, ip)
+                        if (pairedUdn == null) pairedUdn = Relocator.lookUpFingerprint(this, ip)
                     }.start()
                     showSuccess(ip)
                 }
